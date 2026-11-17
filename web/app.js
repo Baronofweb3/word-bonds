@@ -72,7 +72,8 @@ function why(e) {
 // ------------------------------------------------------------------ chain
 
 const S = { bonds: null, tokens: new Map(), claims: new Map(), records: new Map(), events: null, account: null, wc: null, wallet: null };
-let rpc = createPublicClient({ chain: xLayer, transport: http(RPC_URL, { retryCount: 1, timeout: 15000 }) });
+// The public RPC accepts up to 10 calls per batch.
+let rpc = createPublicClient({ chain: xLayer, transport: http(RPC_URL, { batch: { batchSize: 10 }, retryCount: 1, timeout: 15000 }) });
 
 function registry() {
   if (isAddress(BUILT_REGISTRY)) return getAddress(BUILT_REGISTRY);
@@ -148,20 +149,56 @@ async function freshBond(id) {
   return out;
 }
 
-// One getLogs call for the whole history. If the RPC refuses the range, the
-// paper trail falls back to the explorer.
-async function loadEvents(force) {
-  if (S.events !== null && !force) return S.events;
-  try {
-    const logs = await rpc.getContractEvents({ address: WB, abi: WB_ABI, fromBlock: FROM_BLOCK, toBlock: 'latest' });
-    const blocks = new Map();
-    for (const l of logs) if (!blocks.has(l.blockNumber)) blocks.set(l.blockNumber, null);
-    await Promise.all([...blocks.keys()].map(async (n) => blocks.set(n, (await rpc.getBlock({ blockNumber: n })).timestamp)));
-    S.events = logs.map((l) => ({ name: l.eventName, args: l.args, tx: l.transactionHash, ts: blocks.get(l.blockNumber) }));
-  } catch {
-    S.events = false;
+// X Layer's public RPC serves logs only 100 blocks at a time, so a bond's paper trail
+// is found differently: a binary search over past contract state (the RPC keeps full
+// history) finds the exact block where the bond was made and where it closed, then
+// only those blocks' logs are read. A closed bond's trail never changes, so it is cached.
+// Smallest n in (lo, hi] where test(n) holds; test(hi) must hold. Each round asks
+// 10 points at once, so a million blocks take about six rounds.
+async function firstBlock(test, lo, hi) {
+  while (hi - lo > 1n) {
+    const span = hi - lo, k = span > 10n ? 10n : span - 1n;
+    const pts = [...Array(Number(k)).keys()].map((i) => lo + (span * BigInt(i + 1)) / (k + 1n));
+    const res = await Promise.all(pts.map((n) => test(n).catch(() => false)));
+    const i = res.indexOf(true);
+    if (i < 0) lo = pts[pts.length - 1];
+    else { hi = pts[i]; if (i > 0) lo = pts[i - 1]; }
   }
-  return S.events;
+  return hi;
+}
+const pastRead = (functionName, args, blockNumber) => rpc.readContract({ address: WB, abi: WB_ABI, functionName, args, blockNumber });
+async function eventsAt(blockNumber, id) {
+  const [logs, blk] = await Promise.all([
+    rpc.getContractEvents({ address: WB, abi: WB_ABI, fromBlock: blockNumber, toBlock: blockNumber }),
+    rpc.getBlock({ blockNumber }),
+  ]);
+  return logs.filter((l) => l.args?.bondId !== undefined && Number(l.args.bondId) === id)
+    .map((l) => ({ name: l.eventName, args: l.args, tx: l.transactionHash, ts: blk.timestamp }));
+}
+async function trailOf(b) {
+  const key = `wb-trail-${WB}-${b.id}`;
+  if (b.status !== ACTIVE) {
+    try { const c = localStorage.getItem(key); if (c) return JSON.parse(c, (k, v) => (v && typeof v === 'object' && '$n' in v ? BigInt(v.$n) : v)); } catch {}
+  }
+  const latest = await rpc.getBlockNumber();
+  const madeKey = `wb-made-${WB}-${b.id}`;
+  const findMade = async () => {
+    try { const c = localStorage.getItem(madeKey); if (c) return BigInt(c); } catch {}
+    const n = await firstBlock(async (x) => (await pastRead('bondCount', [], x)) > BigInt(b.id), FROM_BLOCK - 1n, latest);
+    try { localStorage.setItem(madeKey, String(n)); } catch {}
+    return n;
+  };
+  // A bond's status before it existed reads as "not active" by accident, so the closing
+  // search starts once the bond exists: it runs alongside the first, from its own floor.
+  const findClosed = async () => (b.status === ACTIVE ? null
+    : firstBlock(async (x) => Number((await pastRead('getBond', [BigInt(b.id)], x)).status) > ACTIVE, FROM_BLOCK - 1n, latest));
+  const [made, closed] = await Promise.all([findMade(), findClosed()]);
+  let evs = await eventsAt(made, b.id);
+  if (closed !== null) {
+    evs = evs.concat(await eventsAt(closed, b.id));
+    try { localStorage.setItem(key, JSON.stringify(evs, (k, v) => (typeof v === 'bigint' ? { $n: v.toString() } : v))); } catch {}
+  }
+  return evs;
 }
 
 // ------------------------------------------------------------------ wallet
@@ -368,10 +405,14 @@ async function bondPage(id) {
   if (tk !== seq) return;
   if (!b) { app().innerHTML = `<div class="soon"><h2>No bond ${id} yet</h2><p>There are ${bonds.length} bonds on the record.</p><p><a class="back" href="#home">← Back to the record</a></p></div>`; return; }
   const st = STATE[b.status], T = b.token$, v = b.verdict;
-  const [rec] = await Promise.all([record(b.maker).catch(() => null), loadEvents()]);
+  const rec = await record(b.maker).catch(() => null);
   if (tk !== seq) return;
-  const brokeEv = () => S.events && S.events.find((e) => e.name === 'BondBroken' && Number(e.args.bondId) === id);
-  const held = v ? v.held : brokeEv() ? Number(brokeEv().args.heldBps) : null;
+  const held = v ? v.held : null;
+  const holdHTML = (h, label) => `<div class="hold">
+          <div class="hold-top"><span class="label">${label}, against the day the bond was made</span><b>${pct(h)}</b></div>
+          <div class="meter${h < b.floorBps ? ' bad' : ''}"><i style="width:${Math.min(h / 100, 100)}%"></i><u style="left:calc(${b.floorBps / 100}% - 1px)"></u></div>
+          <div class="scale"><span style="left:0">0%</span><span style="left:${b.floorBps / 100}%">floor ${pct(b.floorBps)}</span><span style="left:100%">100%</span></div>
+        </div>`;
   const isMaker = S.account && S.account.toLowerCase() === b.maker.toLowerCase();
   const V = st === 'active'
     ? (v?.breach
@@ -407,11 +448,7 @@ async function bondPage(id) {
           <div><dt class="label">Until</dt><dd>${dayLocal(b.deadline)}<small>${timeLocal(b.deadline)} · ${st === 'active' ? `<span data-deadline="${b.deadline}">${left(b.deadline)}</span>` : 'closed'}</small></dd></div>
           <div><dt class="label">Token</dt><dd>${esc(T.symbol)}<small class="mono"><a href="${ADDR(b.token)}" target="_blank" rel="noopener">${short(b.token)}</a></small></dd></div>
         </dl>
-        ${held !== null ? `<div class="hold">
-          <div class="hold-top"><span class="label">${st === 'active' ? 'Held now' : 'Held when challenged'}, against the day the bond was made</span><b>${pct(held)}</b></div>
-          <div class="meter${held < b.floorBps ? ' bad' : ''}"><i style="width:${Math.min(held / 100, 100)}%"></i><u style="left:calc(${b.floorBps / 100}% - 1px)"></u></div>
-          <div class="scale"><span style="left:0">0%</span><span style="left:${b.floorBps / 100}%">floor ${pct(b.floorBps)}</span><span style="left:100%">100%</span></div>
-        </div>` : ''}
+        <div id="hold-slot">${held !== null ? holdHTML(held, 'Held now') : ''}</div>
       </div>
       <canvas aria-hidden="true"></canvas>
     </article>
@@ -452,13 +489,17 @@ async function bondPage(id) {
   $('a-copy').onclick = async () => { const el = $('a-copy'); try { await navigator.clipboard.writeText(location.href.split('#')[0] + '#bond-' + id); el.textContent = 'Link copied'; } catch { el.textContent = 'Copy blocked here'; } setTimeout(() => (el.textContent = 'Copy link'), 1800); };
   $('a-challenge').onclick = act(() => send({ address: WB, abi: WB_ABI, functionName: 'challenge', args: [BigInt(id)] }, 'Challenge'), id);
   $('a-release').onclick = act(() => send({ address: WB, abi: WB_ABI, functionName: 'release', args: [BigInt(id)] }, 'Release'), id);
-  const evs = await loadEvents();
+  let evs = null;
+  try { evs = await trailOf(b); } catch {}
   if (tk !== seq) return;
   const rows = [];
-  if (evs) {
-    for (const e of evs.filter((x) => Number(x.args.bondId) === id)) {
+  if (evs && evs.length) {
+    for (const e of evs) {
       if (e.name === 'BondCreated') rows.push([e.ts, `Bond made. ${okb(e.args.amount)} locked after the 1% fee.`, e.tx]);
-      if (e.name === 'BondBroken') rows.push([e.ts, `Challenged at ${pct(e.args.heldBps)} held. Circuit ruled the promise broken. ${okb(e.args.slashed)} burned, ${okb(e.args.bounty)} paid to the challenger.`, e.tx]);
+      if (e.name === 'BondBroken') {
+        rows.push([e.ts, `Challenged at ${pct(e.args.heldBps)} held. Circuit ruled the promise broken. ${okb(e.args.slashed)} burned, ${okb(e.args.bounty)} paid to the challenger.`, e.tx]);
+        if (held === null) $('hold-slot').innerHTML = holdHTML(Number(e.args.heldBps), 'Held when challenged');
+      }
       if (e.name === 'BondKept') rows.push([e.ts, `Released after the deadline. ${okb(e.args.amount)} returned to the maker.`, e.tx]);
     }
   } else {
