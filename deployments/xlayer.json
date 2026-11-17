@@ -1,0 +1,40 @@
+{
+  "chainId": 196,
+  "date": "2026-11-16",
+  "deployer": "0xD4a40e231C571a9180A54F5fB49cE97415f62f48",
+  "processor": "0x57F319CF056F72F48cF1dbb670F2A3DB007Aa355",
+  "processorName": "OrderGuard",
+  "circuitId": 19,
+  "wordBonds": "0x25d816626bd0ab53e468b8f8452b000043f6cb01",
+  "templateId": 0,
+  "treasury": "0xD4a40e231C571a9180A54F5fB49cE97415f62f48",
+  "slashSink": "0x000000000000000000000000000000000000dEaD",
+  "feeBps": 100,
+  "tx": {
+    "mint": "0xb9df5c13b29449345f63afd81ad098f399d06660961c73018cf4ad7a9414a821",
+    "tapeout": "0xaeeca806a3f821c024e5436241bff08fdad6968bc1512c37a625684020489bf4",
+    "deploy": "0x4e92c6fa9a9e5bb96345f9fd71e9d2def5e3eb85d30496572f728e4fb2e4e5c9",
+    "addTemplate": "0xb4dbf1d22e8c626fffe69f72ff7ef0b4f5bb9bf705eac049cef04349e1382d56"
+  },
+  "liveCheck": "circuitInfo 33/2/0/119, netlist identical, 48/48 eval vectors matched",
+  "testToken": {
+    "symbol": "WOKB",
+    "address": "0xe538905cf8410324e03A5A23C1c177a474D59b2b"
+  },
+  "liveBonds": [
+    {
+      "id": 0,
+      "outcome": "Broken",
+      "created": "0x435b9b5bbca49e234d0a20bc6ae66a63959acd9bae002d84380e2c39650e8bed",
+      "challenge": "0x0e1ddd44166b57667690203231e37b5cb6c1b5c5a0f0c1cc391a5a66a2fc9c28",
+      "note": "wallet dropped to 40% of baseline against a 50% floor; 0.000495 OKB bounty, 0.004455 OKB slashed; challenge used 441,443 gas"
+    },
+    {
+      "id": 1,
+      "outcome": "Active",
+      "created": "0x2e56b8c834e3026c7ba8b624b357c99504467a0a0aadbd6964086a61fb2cd281",
+      "note": "releasable after 2026-11-18 00:35 local (WAT) if the wallet keeps at least 0.002 WOKB"
+    }
+  ],
+  "handleRegistry": "0x22c27b5a70b9c082911d7ec555d8fc9d8de1e0e3"
+}

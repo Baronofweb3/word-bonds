@@ -1,0 +1,8 @@
+{
+  "name": "wordbonds-site",
+  "private": true,
+  "type": "module",
+  "scripts": { "build": "node build.mjs" },
+  "dependencies": { "viem": "2.57.12" },
+  "devDependencies": { "esbuild": "0.28.2" }
+}
