@@ -213,7 +213,7 @@ async function trailOf(b) {
 
 const XLAYER = { chainId: '0xc4', chainName: 'X Layer Mainnet', nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 }, rpcUrls: [RPC_URL], blockExplorerUrls: ['https://www.oklink.com/xlayer'] };
 const KNOWN = [
-  { rdns: 'com.okex.wallet', name: 'OKX Wallet', install: 'https://web3.okx.com/download', open: (u) => `https://web3.okx.com/download?deeplink=${encodeURIComponent(`okx://wallet/dapp/url?dappUrl=${encodeURIComponent(u)}`)}` },
+  { rdns: 'com.okex.wallet', name: 'OKX Wallet', install: 'https://web3.okx.com/download', store: 'https://web3.okx.com/download', open: (u) => `https://web3.okx.com/download?deeplink=${encodeURIComponent(`okx://wallet/dapp/url?dappUrl=${encodeURIComponent(u)}`)}` },
   { rdns: 'io.metamask', name: 'MetaMask', install: 'https://metamask.io/download/', open: (u) => `https://metamask.app.link/dapp/${u.replace(/^https?:\/\//, '')}` },
   { rdns: 'com.trustwallet.app', name: 'Trust Wallet', install: 'https://trustwallet.com/download', open: (u) => `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(u)}` },
   { rdns: 'com.coinbase.wallet', name: 'Coinbase Wallet', install: 'https://www.coinbase.com/wallet/downloads', open: (u) => `https://go.cb-w.com/dapp?cb_url=${encodeURIComponent(u)}` },
@@ -276,7 +276,9 @@ const avatar = (w) => w.icon ? `<img src="${esc(w.icon)}" alt="" width="28" heig
 function renderPicker() {
   const list = legacy(), mobile = isMobile(), here = location.href;
   const installed = list.map((w) => `<button class="wopt" data-rdns="${esc(w.rdns)}">${avatar(w)}<span class="wtxt">${esc(w.name)}${w.rdns === W.rdns ? '<small>Connected</small>' : w.rdns.startsWith('com.okex') ? '<small>X Layer’s home wallet</small>' : ''}</span><i>›</i></button>`).join('');
-  const handoff = KNOWN.filter((k) => k.open).map((k) => `<a class="wopt" href="${esc(k.open(here))}" rel="noopener">${avatar(k)}<span class="wtxt">${esc(k.name)}<small>Opens this page in the app</small></span><i>↗</i></a>`).join('');
+  // OKX's link opens in a new tab: if the app is missing, OKX's page can hang, and this page must stay usable.
+  const handoff = KNOWN.filter((k) => k.open).map((k) => `<a class="wopt" data-w="${esc(k.rdns)}" href="${esc(k.open(here))}" rel="noopener"${k.rdns === 'com.okex.wallet' ? ' target="_blank"' : ''}>${avatar(k)}<span class="wtxt">${esc(k.name)}<small>Opens this page in the app</small></span><i>↗</i></a>`).join('')
+    + `<p class="whelp small">Didn’t open? <button class="wcopy" type="button">Copy this page’s link</button> and paste it into your wallet app’s browser.</p>`;
   const get = KNOWN.map((k) => `<a href="${esc(k.install)}" target="_blank" rel="noopener">${esc(k.name)}</a>`).join(' · ');
   $('wdlg-body').innerHTML = list.length
     ? `<p class="wsec">${mobile ? 'Wallet in this app' : 'Found in this browser'}</p><div class="wlist">${installed}</div>`
@@ -284,6 +286,16 @@ function renderPicker() {
       ? `<p class="whelp">Your phone’s browser has no wallet built in. Pick your wallet app and this exact page opens inside it, ready to connect.</p><div class="wlist">${handoff}</div><p class="whelp small">No wallet yet? ${get}</p>`
       : `<p class="whelp">No wallet found in this browser. Install one, then reload this page.</p><div class="wget">${get}</div><p class="whelp small">On a phone? Open this page inside your wallet app’s browser.</p>`;
   $('wdlg-body').querySelectorAll('button.wopt').forEach((b) => (b.onclick = () => choose(b.dataset.rdns)));
+  $('wdlg-body').querySelectorAll('.wcopy').forEach((b) => (b.onclick = () => navigator.clipboard?.writeText(location.href)
+    .then(() => { $('wdlg-note').textContent = 'Link copied. Open your wallet app, go to its browser, and paste it.'; })
+    .catch(() => { $('wdlg-note').textContent = location.href; })));
+  $('wdlg-body').querySelectorAll('a.wopt[data-w]').forEach((a) => (a.onclick = () => {
+    const k = KNOWN.find((x) => x.rdns === a.dataset.w);
+    $('wdlg-note').innerHTML = k.store
+      ? `If ${esc(k.name)} didn’t open, you may not have it yet: <a href="${esc(k.store)}" target="_blank" rel="noopener">get ${esc(k.name)}</a>, then come back and tap it again.`
+      : `Opening ${esc(k.name)}… If nothing happens, use the copy link option below the list.`;
+    $('wdlg-note').scrollIntoView({ block: 'nearest' });
+  }));
 }
 async function choose(rdns) {
   const w = W.found.get(rdns); if (!w) return;
