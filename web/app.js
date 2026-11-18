@@ -62,6 +62,8 @@ function left(ts) {
 const reduced = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
 function why(e) {
   if (!e) return 'Something went wrong.';
+  if (e.code === 'CLOSED') return 'No wallet connected. Nothing was sent.';
+  if (e.code === -32002) return 'Your wallet already has a request waiting. Open the wallet and finish or reject it.';
   if (e.code === 4001 || /rejected|denied/i.test(e.shortMessage || e.message || '')) return 'You cancelled in your wallet. Nothing was sent.';
   const hit = typeof e.walk === 'function' ? e.walk((x) => x?.data?.errorName) : null;
   const name = hit?.data?.errorName || (e.shortMessage || e.message || '').match(/(\w+)\(\)/)?.[1];
@@ -86,7 +88,7 @@ async function rd(address, abi, functionName, args = []) {
     return await rpc.readContract({ address, abi, functionName, args });
   } catch (e) {
     const net = /HttpRequestError|TimeoutError|fetch|network/i.test(`${e.name} ${e.shortMessage} ${e.message}`);
-    if (net && S.wallet && rpc !== S.wallet) { rpc = S.wallet; return rpc.readContract({ address, abi, functionName, args }); }
+    if (net && S.wallet && W.chainId === '0xc4' && rpc !== S.wallet) { rpc = S.wallet; return rpc.readContract({ address, abi, functionName, args }); }
     throw e;
   }
 }
@@ -202,32 +204,213 @@ async function trailOf(b) {
 }
 
 // ------------------------------------------------------------------ wallet
+//
+// Every injected wallet is found through EIP-6963 (OKX, MetaMask, Rabby, Coinbase, Trust, Bitget…),
+// with the old window.ethereum as a fallback. The user picks one; we remember the choice and
+// reconnect silently next time. Disconnect revokes the site's permission where the wallet
+// supports it and always forgets the session. On a phone without a wallet, we hand the page
+// over to the wallet app's own browser.
 
-async function connect() {
-  const eth = window.ethereum;
-  if (!eth) throw new Error('No wallet found. Install MetaMask, or open this page in your wallet app’s browser.');
-  const [a] = await eth.request({ method: 'eth_requestAccounts' });
+const XLAYER = { chainId: '0xc4', chainName: 'X Layer Mainnet', nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 }, rpcUrls: [RPC_URL], blockExplorerUrls: ['https://www.oklink.com/xlayer'] };
+const KNOWN = [
+  { rdns: 'com.okex.wallet', name: 'OKX Wallet', install: 'https://web3.okx.com/download', open: (u) => `okx://wallet/dapp/url?dappUrl=${encodeURIComponent(u)}` },
+  { rdns: 'io.metamask', name: 'MetaMask', install: 'https://metamask.io/download/', open: (u) => `https://metamask.app.link/dapp/${u.replace(/^https?:\/\//, '')}` },
+  { rdns: 'com.trustwallet.app', name: 'Trust Wallet', install: 'https://trustwallet.com/download', open: (u) => `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(u)}` },
+  { rdns: 'com.coinbase.wallet', name: 'Coinbase Wallet', install: 'https://www.coinbase.com/wallet/downloads', open: (u) => `https://go.cb-w.com/dapp?cb_url=${encodeURIComponent(u)}` },
+  { rdns: 'com.bitget.web3', name: 'Bitget Wallet', install: 'https://web3.bitget.com/en/wallet-download' },
+  { rdns: 'io.rabby', name: 'Rabby', install: 'https://rabby.io' },
+];
+const order = (rdns) => { const i = KNOWN.findIndex((k) => rdns.startsWith(k.rdns)); return i < 0 ? 99 : i; };
+const W = { found: new Map(), eth: null, rdns: null, name: '', icon: '', chainId: null, off: null };
+const isMobile = () => /Android|iPhone|iPad|iPod/i.test(navigator.userAgent) || (navigator.maxTouchPoints > 1 && /Macintosh/.test(navigator.userAgent));
+const store = { get: (k) => { try { return localStorage.getItem(k); } catch { return null; } }, set: (k, v) => { try { v == null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} } };
+
+function legacyName(p) {
+  if (p.isOkxWallet || p.isOKExWallet) return ['com.okex.wallet', 'OKX Wallet'];
+  if (p.isRabby) return ['io.rabby', 'Rabby'];
+  if (p.isCoinbaseWallet) return ['com.coinbase.wallet', 'Coinbase Wallet'];
+  if (p.isTrust || p.isTrustWallet) return ['com.trustwallet.app', 'Trust Wallet'];
+  if (p.isBitKeep || p.isBitgetWallet) return ['com.bitget.web3', 'Bitget Wallet'];
+  if (p.isBraveWallet) return ['com.brave.wallet', 'Brave Wallet'];
+  if (p.isMetaMask) return ['io.metamask', 'MetaMask'];
+  return ['injected', 'Browser wallet'];
+}
+function discover() {
+  addEventListener('eip6963:announceProvider', (e) => {
+    const { info, provider } = e.detail || {};
+    if (!info?.rdns || !provider) return;
+    W.found.set(info.rdns, { rdns: info.rdns, name: info.name, icon: info.icon, provider });
+    if ($('wdlg')?.open) renderPicker();
+  });
+  dispatchEvent(new Event('eip6963:requestProvider'));
+}
+/** Wallets that never announced themselves still count, through window.ethereum / window.okxwallet. */
+function legacy() {
+  for (const p of [window.okxwallet, window.ethereum, ...(window.ethereum?.providers || [])]) {
+    if (!p?.request) continue;
+    const [rdns, name] = legacyName(p);
+    if ([...W.found.values()].some((w) => w.provider === p || w.rdns.startsWith(rdns))) continue;
+    W.found.set(rdns, { rdns, name, icon: '', provider: p });
+  }
+  return [...W.found.values()].sort((a, b) => order(a.rdns) - order(b.rdns) || a.name.localeCompare(b.name));
+}
+
+// ---------------------------------------------------------------- picker
+
+let pick = null; // { resolve, reject } while the picker is waiting for a choice
+function openPicker() {
+  return new Promise((resolve, reject) => {
+    if (pick) pick.reject(Object.assign(new Error('closed'), { code: 'CLOSED' }));
+    pick = { resolve, reject };
+    dispatchEvent(new Event('eip6963:requestProvider'));
+    renderPicker();
+    const d = $('wdlg');
+    if (!d.open) d.showModal();
+  });
+}
+function closePicker(reason) {
+  const d = $('wdlg'); if (d.open) d.close();
+  if (pick) { const p = pick; pick = null; reason ? p.reject(Object.assign(new Error('Wallet selection closed.'), { code: 'CLOSED' })) : p.resolve(); }
+}
+const avatar = (w) => w.icon ? `<img src="${esc(w.icon)}" alt="" width="28" height="28" data-l="${esc(w.name[0] || '?')}" onerror="this.outerHTML='<span class=wav>'+this.dataset.l+'</span>'">` : `<span class="wav">${esc(w.name[0] || '?')}</span>`;
+function renderPicker() {
+  const list = legacy(), mobile = isMobile(), here = location.href;
+  const installed = list.map((w) => `<button class="wopt" data-rdns="${esc(w.rdns)}">${avatar(w)}<span class="wtxt">${esc(w.name)}${w.rdns === W.rdns ? '<small>Connected</small>' : w.rdns.startsWith('com.okex') ? '<small>X Layer’s home wallet</small>' : ''}</span><i>›</i></button>`).join('');
+  const handoff = KNOWN.filter((k) => k.open).map((k) => `<a class="wopt" href="${esc(k.open(here))}" rel="noopener">${avatar(k)}<span class="wtxt">${esc(k.name)}<small>Opens this page in the app</small></span><i>↗</i></a>`).join('');
+  const get = KNOWN.map((k) => `<a href="${esc(k.install)}" target="_blank" rel="noopener">${esc(k.name)}</a>`).join(' · ');
+  $('wdlg-body').innerHTML = list.length
+    ? `<p class="wsec">${mobile ? 'Wallet in this app' : 'Found in this browser'}</p><div class="wlist">${installed}</div>`
+    : mobile
+      ? `<p class="whelp">Your phone’s browser has no wallet built in. Pick your wallet app and this exact page opens inside it, ready to connect.</p><div class="wlist">${handoff}</div><p class="whelp small">No wallet yet? ${get}</p>`
+      : `<p class="whelp">No wallet found in this browser. Install one, then reload this page.</p><div class="wget">${get}</div><p class="whelp small">On a phone? Open this page inside your wallet app’s browser.</p>`;
+  $('wdlg-body').querySelectorAll('button.wopt').forEach((b) => (b.onclick = () => choose(b.dataset.rdns)));
+}
+async function choose(rdns) {
+  const w = W.found.get(rdns); if (!w) return;
+  const btn = $('wdlg-body').querySelector(`[data-rdns="${CSS.escape(rdns)}"]`);
+  btn?.classList.add('busy'); $('wdlg-note').textContent = `Approve the connection in ${w.name}…`;
+  try { await useWallet(w); $('wdlg-note').textContent = ''; closePicker(); }
+  catch (e) { btn?.classList.remove('busy'); $('wdlg-note').textContent = why(e); }
+}
+
+// ---------------------------------------------------------------- session
+
+async function useWallet(w, silent = false) {
+  const eth = w.provider;
+  const accs = await eth.request({ method: silent ? 'eth_accounts' : 'eth_requestAccounts' });
+  if (!accs?.length) { if (silent) return false; throw new Error(`${w.name} returned no account. Unlock it and try again.`); }
+  W.off?.();
+  const onAcc = (a) => (a?.length ? setAccount(a[0]) : forget('Your wallet disconnected this site.'));
+  const onChain = (c) => { W.chainId = String(c).toLowerCase(); header(); };
+  const onDisc = () => forget('Your wallet disconnected.');
+  eth.on?.('accountsChanged', onAcc); eth.on?.('chainChanged', onChain); eth.on?.('disconnect', onDisc);
+  W.off = () => { eth.removeListener?.('accountsChanged', onAcc); eth.removeListener?.('chainChanged', onChain); eth.removeListener?.('disconnect', onDisc); };
+  Object.assign(W, { eth, rdns: w.rdns, name: w.name, icon: w.icon });
+  W.chainId = String(await eth.request({ method: 'eth_chainId' }).catch(() => '')).toLowerCase();
+  store.set('wb-wallet', w.rdns); store.set('wb-off', null);
+  setAccount(accs[0]);
+  if (!silent && W.chainId !== XLAYER.chainId) await switchChain().catch(() => {});
+  return true;
+}
+function setAccount(a) {
+  const next = a ? getAddress(a) : null;
+  const changed = next !== S.account;
+  S.account = next;
+  S.wc = next ? createWalletClient({ chain: xLayer, transport: custom(W.eth), account: next }) : null;
+  S.wallet = next ? createPublicClient({ chain: xLayer, transport: custom(W.eth) }) : null;
+  header();
+  if (changed) route();
+}
+function forget(msg) {
+  W.off?.(); W.off = null;
+  Object.assign(W, { eth: null, rdns: null, name: '', icon: '', chainId: null });
+  setAccount(null);
+  if (msg) toast(msg, null, 'ok');
+}
+async function disconnect() {
+  const eth = W.eth;
+  try { await eth?.request({ method: 'wallet_revokePermissions', params: [{ eth_accounts: {} }] }); } catch {}
+  store.set('wb-off', '1'); store.set('wb-wallet', null);
+  forget('Disconnected. Your wallet no longer shares an address with this site.');
+}
+/** Pick another account inside the same wallet (MetaMask, OKX and others show their account chooser). */
+async function switchAccount() {
   try {
-    await eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: '0xc4' }] });
-  } catch (e) {
-    if (e.code !== 4902) throw e;
-    await eth.request({ method: 'wallet_addEthereumChain', params: [{ chainId: '0xc4', chainName: 'X Layer Mainnet', nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 }, rpcUrls: [RPC_URL], blockExplorerUrls: ['https://www.oklink.com/xlayer'] }] });
+    await W.eth.request({ method: 'wallet_requestPermissions', params: [{ eth_accounts: {} }] });
+    const a = await W.eth.request({ method: 'eth_accounts' });
+    if (a?.[0]) setAccount(a[0]);
+  } catch (e) { if (e?.code !== 4001) toast(`${W.name} can’t switch accounts from here. Switch inside the wallet and this page follows.`, null, 'bad'); }
+}
+async function switchChain() {
+  try { await W.eth.request({ method: 'wallet_switchEthereumChain', params: [{ chainId: XLAYER.chainId }] }); }
+  catch (e) {
+    const unknown = e?.code === 4902 || e?.data?.originalError?.code === 4902 || /unrecognized|not added|unknown chain/i.test(e?.message || '');
+    if (!unknown) throw e;
+    await W.eth.request({ method: 'wallet_addEthereumChain', params: [XLAYER] });
   }
-  S.account = getAddress(a);
-  S.wc = createWalletClient({ chain: xLayer, transport: custom(eth), account: S.account });
-  S.wallet = createPublicClient({ chain: xLayer, transport: custom(eth) });
-  if (!eth.__wb) {
-    eth.__wb = true;
-    eth.on?.('accountsChanged', (accs) => { S.account = accs[0] ? getAddress(accs[0]) : null; if (S.account) S.wc = createWalletClient({ chain: xLayer, transport: custom(eth), account: S.account }); header(); route(); });
-    eth.on?.('chainChanged', () => location.reload());
-  }
+  W.chainId = String(await W.eth.request({ method: 'eth_chainId' })).toLowerCase();
   header();
 }
 
+/** Before any transaction: a wallet, the right account, the right network. */
 async function needWallet() {
-  if (!S.account) await connect();
-  const id = await S.wallet.getChainId();
-  if (id !== 196) throw new Error('Switch your wallet to X Layer Mainnet and try again.');
+  if (!S.account) await openPicker();
+  if (!S.account) throw new Error('Connect a wallet first.');
+  const a = await W.eth.request({ method: 'eth_accounts' }).catch(() => []);
+  if (!a?.length) { forget(); throw new Error('Your wallet is locked or disconnected. Connect again.'); }
+  if (getAddress(a[0]) !== S.account) setAccount(a[0]);
+  W.chainId = String(await W.eth.request({ method: 'eth_chainId' })).toLowerCase();
+  if (W.chainId !== XLAYER.chainId) {
+    toast(`Switch ${W.name} to X Layer Mainnet to continue…`);
+    await switchChain();
+    if (W.chainId !== XLAYER.chainId) throw new Error('Your wallet is still on another network. Switch to X Layer Mainnet and try again.');
+  }
+}
+
+async function restore() {
+  if (store.get('wb-off')) return;
+  await new Promise((r) => setTimeout(r, 350)); // let wallets announce themselves
+  const saved = store.get('wb-wallet'), list = legacy();
+  const w = (saved && list.find((x) => x.rdns === saved)) || (!saved && list.length === 1 ? list[0] : null);
+  if (w) await useWallet(w, true).catch(() => {});
+}
+
+// ---------------------------------------------------------------- header menu
+
+function walletMenu() {
+  const m = $('wmenu'), wrong = W.chainId && W.chainId !== XLAYER.chainId;
+  m.innerHTML = `<div class="wm-head">${avatar({ name: W.name || '?', icon: W.icon })}<div><b>${esc(W.name)}</b><span class="mono">${short(S.account)}</span></div></div>
+    <div class="wm-net ${wrong ? 'bad' : ''}"><span>${wrong ? 'On another network' : 'Connected to X Layer Mainnet'}</span>${wrong ? '<button class="btn" id="wm-sw">Switch</button>' : ''}</div>
+    <button id="wm-copy">Copy address</button>
+    <a href="#maker-${S.account}">My record</a>
+    <a href="${ADDR(S.account)}" target="_blank" rel="noopener">View on explorer ↗</a>
+    <button id="wm-acc">Switch account</button>
+    <button id="wm-wal">Switch wallet</button>
+    <button id="wm-off" class="danger">Disconnect</button>`;
+  const close = () => { m.hidden = true; $('connect').setAttribute('aria-expanded', 'false'); };
+  m.querySelectorAll('a').forEach((a) => (a.onclick = close));
+  $('wm-copy').onclick = () => { navigator.clipboard?.writeText(S.account).then(() => toast('Address copied.', null, 'ok')); close(); };
+  $('wm-acc').onclick = () => { close(); switchAccount(); };
+  $('wm-wal').onclick = () => { close(); openPicker().catch(() => {}); };
+  $('wm-off').onclick = () => { close(); disconnect(); };
+  if ($('wm-sw')) $('wm-sw').onclick = () => { close(); switchChain().catch(fail); };
+  m.hidden = false; $('connect').setAttribute('aria-expanded', 'true');
+}
+
+function walletUI() {
+  $('connect').onclick = (e) => {
+    e.stopPropagation();
+    if (!S.account) return openPicker().catch(() => {});
+    $('wmenu').hidden ? walletMenu() : ($('wmenu').hidden = true);
+  };
+  document.addEventListener('click', (e) => { const m = $('wmenu'); if (!m.hidden && !m.contains(e.target)) m.hidden = true; });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') $('wmenu').hidden = true; });
+  $('wdlg-x').onclick = () => closePicker('closed');
+  $('wdlg').addEventListener('cancel', (e) => { e.preventDefault(); closePicker('closed'); });
+  $('wdlg').addEventListener('click', (e) => { if (e.target === $('wdlg')) closePicker('closed'); });
+  $('netbar-sw').onclick = () => switchChain().catch(fail);
+  discover();
+  restore();
 }
 
 /** Dry-run, then send, then wait. Every step is shown in the toast. */
@@ -306,11 +489,16 @@ function guilloche(c, seed) {
 const draw = () => document.querySelectorAll('canvas').forEach((c, i) => guilloche(c, (i % 2) * 1.6));
 
 function header() {
-  const a = S.account;
-  $('connect').textContent = a ? short(a) : 'Connect wallet';
-  $('connect').title = a ? `Connected: ${a}` : '';
+  const a = S.account, c = $('connect');
+  c.innerHTML = a ? `${W.icon ? `<img src="${esc(W.icon)}" alt="" width="16" height="16">` : ''}<span class="mono">${short(a)}</span><i aria-hidden="true">▾</i>` : 'Connect wallet';
+  c.title = a ? `${W.name}: ${a}` : '';
+  c.setAttribute('aria-haspopup', a ? 'menu' : 'dialog');
   $('mine').hidden = !a;
   if (a) $('mine').href = `#maker-${a}`;
+  const wrong = !!(a && W.chainId && W.chainId !== '0xc4');
+  $('netbar').hidden = !wrong;
+  if (wrong) $('netbar-name').textContent = W.name;
+  if (!a) $('wmenu').hidden = true;
 }
 
 const loading = (what) => `<div class="loading"><span class="dot"></span>Reading ${esc(what)} from X Layer…</div>`;
@@ -832,10 +1020,9 @@ function route() {
 }
 
 window.addEventListener('DOMContentLoaded', () => {
-  $('connect').onclick = () => connect().then(route).catch(fail);
+  walletUI();
   const reg = registry();
   $('f-contract').innerHTML = `Contract <a class="mono" href="${ADDR(WB)}" target="_blank" rel="noopener">${short(WB)}</a>${reg ? ` · Handles <a class="mono" href="${ADDR(reg)}" target="_blank" rel="noopener">${short(reg)}</a>` : ''}`;
-  window.ethereum?.request({ method: 'eth_accounts' }).then((a) => { if (a?.[0]) connect().then(route).catch(() => {}); }).catch(() => {});
   route();
   addEventListener('hashchange', route);
   addEventListener('resize', draw);
