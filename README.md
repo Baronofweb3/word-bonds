@@ -44,6 +44,17 @@ Synthesised with [TapeSynth](https://github.com/Cheeeeez/tapesynth) to 119 NAND 
 
 People search by name, not by wallet. [`src/HandleRegistry.sol`](src/HandleRegistry.sol) lets a wallet point at an X handle: the maker posts one line from their X account naming the wallet, then saves the link to that post. The contract checks that the link is a post on the claimed handle's own account. It cannot read X, so the site labels a handle as *claimed*, with the proof post one click away, and never as *verified*.
 
+## Wallets
+
+The site works with any EVM wallet, on desktop and on phones:
+
+- **Desktop:** every installed browser wallet is detected (EIP-6963), so OKX Wallet, MetaMask, Rabby, Coinbase Wallet, Trust, Bitget and older-style wallets all appear in one picker. OKX Wallet, X Layer's home wallet, is listed first. With two wallets installed, the user chooses; they never fight over the page.
+- **Phones:** inside a wallet app's browser it connects directly. In Safari or Chrome, the picker opens this exact page inside OKX Wallet, MetaMask, Trust or Coinbase Wallet.
+- **Session:** a wallet menu shows the connected wallet and network, with copy address, switch account, switch wallet and disconnect. Disconnect revokes the site's permission in the wallet where supported, and a reload does not reconnect. A returning user is reconnected silently to the wallet they chose.
+- **Network:** if the wallet is on another chain, a banner offers a one-click switch to X Layer Mainnet, adding the network if the wallet does not know it yet. Account and network are checked again before every transaction.
+
+The site never asks for a seed phrase or private key.
+
 ## Money flow
 
 | Event | Where the money goes |

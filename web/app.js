@@ -213,7 +213,7 @@ async function trailOf(b) {
 
 const XLAYER = { chainId: '0xc4', chainName: 'X Layer Mainnet', nativeCurrency: { name: 'OKB', symbol: 'OKB', decimals: 18 }, rpcUrls: [RPC_URL], blockExplorerUrls: ['https://www.oklink.com/xlayer'] };
 const KNOWN = [
-  { rdns: 'com.okex.wallet', name: 'OKX Wallet', install: 'https://web3.okx.com/download', open: (u) => `okx://wallet/dapp/url?dappUrl=${encodeURIComponent(u)}` },
+  { rdns: 'com.okex.wallet', name: 'OKX Wallet', install: 'https://web3.okx.com/download', open: (u) => `https://web3.okx.com/download?deeplink=${encodeURIComponent(`okx://wallet/dapp/url?dappUrl=${encodeURIComponent(u)}`)}` },
   { rdns: 'io.metamask', name: 'MetaMask', install: 'https://metamask.io/download/', open: (u) => `https://metamask.app.link/dapp/${u.replace(/^https?:\/\//, '')}` },
   { rdns: 'com.trustwallet.app', name: 'Trust Wallet', install: 'https://trustwallet.com/download', open: (u) => `https://link.trustwallet.com/open_url?coin_id=60&url=${encodeURIComponent(u)}` },
   { rdns: 'com.coinbase.wallet', name: 'Coinbase Wallet', install: 'https://www.coinbase.com/wallet/downloads', open: (u) => `https://go.cb-w.com/dapp?cb_url=${encodeURIComponent(u)}` },
